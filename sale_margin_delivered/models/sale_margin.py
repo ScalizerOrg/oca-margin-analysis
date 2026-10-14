@@ -1,7 +1,7 @@
 # Copyright 2018 Tecnativa - Sergio Teruel
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
-from odoo import api, fields, models
+from odoo import api, fields, models, tools
 
 
 class SaleOrderLine(models.Model):
@@ -39,16 +39,78 @@ class SaleOrderLine(models.Model):
         "have this information until you validate the corresponding delivery note.",
     )
 
-    # [MIG v19]: stock.valuation.layer was removed in Odoo 19 (replaced by
-    # product.value). Original v18 code relied on move.stock_valuation_layer_ids
-    # to compute delivered margin from actual outgoing/return valuation layers.
-    # Until a proper v19 port is done, keep the fields declared but stub the
-    # compute so the module loads. Values will remain 0.0 — do NOT rely on them
-    # for reporting.
-    # TODO: rewrite using product.value / stock.move accounting in v19.
-    @api.depends("margin", "qty_delivered", "product_uom_qty")
+    def _get_delivered_margin_moves(self):
+        """Gets all done Stock Moves that should be considered for Delivered
+        Margin calculation: valued outgoing moves and customer returns to
+        refund."""
+        self.ensure_one()
+        return self.move_ids.filtered(
+            lambda m: m.state == "done"
+            and (
+                m.is_out
+                or (m.is_in and m.to_refund and m.location_id.usage == "customer")
+            )
+        )
+
+    @api.depends(
+        "margin",
+        "qty_delivered",
+        "product_uom_qty",
+        "move_ids.state",
+        "move_ids.value",
+    )
     def _compute_margin_delivered(self):
-        for line in self:
-            line.margin_delivered = 0.0
-            line.margin_delivered_percent = 0.0
-            line.purchase_price_delivery = 0.0
+        """Computes the Delivered Margin of the Lines.
+
+        It is calculated based on the value of the Stock Moves of each Line
+        (v19: stock.valuation.layer was replaced by stock.move.value).
+        """
+        digits = self.env["decimal.precision"].precision_get("Product Price")
+        self.margin_delivered = 0.0
+        self.margin_delivered_percent = 0.0
+        self.purchase_price_delivery = 0.0
+        for line in self.filtered("qty_delivered"):
+            # we need to compute the price reduce to avoid rounding issues
+            # the one stored in the line is rounded to the product price precision
+            price_reduce_taxexcl = (
+                line.price_subtotal / line.product_uom_qty
+                if line.product_uom_qty
+                else 0.0
+            )
+
+            if not line.product_id.is_storable:
+                currency = (
+                    line.order_id.pricelist_id.currency_id
+                    or line.company_id.currency_id
+                )
+                price = line.purchase_price
+                line.margin_delivered = currency.round(
+                    line.price_subtotal - (price * line.qty_delivered)
+                )
+                line.purchase_price_delivery = price
+            else:
+                # v19 move values and valued quantities are unsigned: outgoing
+                # moves are counted negative, like the v18 valuation layers
+                value_delivered = qty_delivered = 0.0
+                for move in line._get_delivered_margin_moves():
+                    sign = -1 if move.is_out else 1
+                    value_delivered += sign * move.value
+                    qty_delivered += sign * move.product_id.uom_id._compute_quantity(
+                        move._get_valued_qty(), line.product_uom_id
+                    )
+                qty_delivered = qty_delivered or -line.qty_delivered
+                # purchase_price_delivery always will be positive
+                # because division of same signs
+                line.purchase_price_delivery = tools.float_round(
+                    value_delivered / qty_delivered, precision_digits=digits
+                )
+                # Inverse qty_delivered because outgoing quantities are negative
+                line.margin_delivered = -qty_delivered * (
+                    price_reduce_taxexcl - line.purchase_price_delivery
+                )
+            # compute percent margin based on delivered quantities or ordered
+            # quantities
+            if price_reduce_taxexcl:
+                line.margin_delivered_percent = (
+                    price_reduce_taxexcl - line.purchase_price_delivery
+                ) / price_reduce_taxexcl
